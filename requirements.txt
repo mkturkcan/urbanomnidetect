@@ -1,0 +1,13 @@
+# Core runtime
+ultralytics>=8.3.0
+torch>=2.1
+numpy>=1.24
+opencv-python>=4.8
+scipy>=1.10
+# Auxiliary head / publication figures
+scikit-learn>=1.3
+matplotlib>=3.7
+# Anti-aliased TrueType label / HUD rendering (falls back to OpenCV if absent)
+pillow>=9.0
+# 3D / BEV IoU evaluation (eval3d.py)
+shapely>=2.0

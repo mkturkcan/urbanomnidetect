@@ -101,6 +101,7 @@ The BEV head maps ground-contact keypoints to a top-down plane through a learned
 python draw_bev.py \
     --image your_image.jpg \
     --kp-model checkpoints/urbanomnidetect_yolo11x-p2_1920.pt \
+    --kp-imgsz 1920 \
     --mode both \
     --device cuda:0
 ```
@@ -109,16 +110,20 @@ This produces two outputs: a publication-quality matplotlib figure and a lightwe
 
 ### Real-Time BEV on Video
 
-For video streams with TensorRT acceleration:
+The video pipeline detects objects, tracks them across frames, solves the BEV homography, and renders the camera view next to a bird's-eye view. Tracked objects keep a stable identity and hold their last position when a detection is briefly missed, so the layout stays steady.
 
 ```bash
 python bev_realtime.py \
     --input drone_manhattan.mp4 \
-    --kp-model checkpoints/urbanomnidetect_yolo11x-p2_1920.pt \
-    --kp-imgsz 1920 \
-    --homography adam \
-    --export tensorrt
+    --kp-model checkpoints/urbanomnidetect_yolo11x-p2_640.pt \
+    --kp-imgsz 640 \
+    --aux-model yolo26x.pt \
+    --device cuda:0 \
+    --export tensorrt \
+    --output bev.mp4
 ```
+
+Add `--display` for a live window. For high-resolution infrastructure or aerial streams, `sahi_tracker.py` runs the same pipeline over overlapping image tiles to recover small and distant objects. See `USAGE.md` for the full command reference.
 
 ## Training
 
@@ -177,11 +182,14 @@ urbanomniview/
     dataset/             # Dataset YAML configs
     models/              # YOLO model architecture YAMLs
     experiments.py       # All training experiment definitions
-  train.py              # Training launcher
-  draw_bev.py           # BEV visualization, standalone
-  bev_realtime.py       # Real-time BEV pipeline with TensorRT
-  homography_rt.py      # Homography solver
-  sahi_tracker.py       # SAHI-based sliced inference and tracking
+  train.py               # Training launcher
+  draw_bev.py            # Standalone BEV for a single image
+  bev_realtime.py        # Real-time detection, tracking, and BEV for video
+  sahi_tracker.py        # Sliced inference and tracking for high-resolution streams
+  eval3d.py              # 2D, BEV, and 3D IoU evaluation
+  homography_rt.py       # Orthogonality-constrained BEV homography solver
+  uod/                   # Shared runtime package (keypoints, bev, tracking, aux head, viz)
+  USAGE.md               # Full command reference for the inference tools
 ```
 
 ## Citation
