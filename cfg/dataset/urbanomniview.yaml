@@ -1,0 +1,10 @@
+path: ./urbanomniview/
+train: '../.././urbanomniview_train.txt'
+val: '../.././urbanomniview_val.txt'
+test: '../.././urbanomniview_test.txt'
+
+nc: 3
+
+names: ['car', 'person', 'bike']
+
+kpt_shape: [8, 2]
