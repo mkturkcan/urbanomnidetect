@@ -180,6 +180,62 @@ class BEVViewport:
         return self._sim.apply(np.asarray(rect_points, dtype=np.float64))
 
     # ------------------------------------------------------------------ #
+    def fov_polygon(self, H: np.ndarray, img_wh: Tuple[int, int],
+                    per_edge: int = 48) -> Optional[np.ndarray]:
+        """Canvas polygon of the ground actually seen by the camera.
+
+        Projects the image border through ``H`` and keeps the part in front of
+        the camera (below the horizon), clipped to the radar's max range. The
+        convex hull of those points is the visible field of view -- the region
+        of the BEV where detections can exist.
+        """
+        if self._sim is None:
+            return None
+        W, Hi = float(img_wh[0]), float(img_wh[1])
+        n = int(per_edge)
+        edges = [
+            np.stack([np.linspace(0, W, n), np.full(n, Hi)], axis=1),    # bottom
+            np.stack([np.full(n, W), np.linspace(Hi, 0, n)], axis=1),    # right
+            np.stack([np.linspace(W, 0, n), np.full(n, 0.0)], axis=1),   # top
+            np.stack([np.full(n, 0.0), np.linspace(0, Hi, n)], axis=1),  # left
+        ]
+        border = np.vstack(edges)
+        ph = np.concatenate([border, np.ones((len(border), 1))], axis=1) @ np.asarray(H).T
+        w = ph[:, 2]
+        # "In front of camera" = same sign of w as the near anchor (image bottom).
+        wa = float((np.asarray(H) @ np.array([W * 0.5, Hi - 1.0, 1.0]))[2])
+        front = 1.0 if wa >= 0 else -1.0
+        wsafe = np.where(np.abs(w) < 1e-9, 1e-9, w)
+        rect = ph[:, :2] / wsafe[:, None]
+        canv = self._sim.apply(rect)
+        ok = (w * front > 1e-6) & np.all(np.isfinite(canv), axis=1)
+        pts = canv[ok]
+        if len(pts) < 3:
+            return None
+        cc = np.array(self.camera_canvas, dtype=np.float64)
+        r_max = (self.H - 2 * self.margin) * 0.99
+        d = pts - cc
+        rad = np.hypot(d[:, 0], d[:, 1])
+        scl = np.minimum(1.0, r_max / np.maximum(rad, 1e-6))
+        pts = cc + d * scl[:, None]
+        hull = cv2.convexHull(pts.astype(np.float32))
+        return hull.reshape(-1, 2)
+
+    def draw_fov(self, canvas: np.ndarray, H: np.ndarray,
+                 img_wh: Tuple[int, int]) -> None:
+        """Shade + outline the currently visible field of view on the radar."""
+        from . import style
+        poly = self.fov_polygon(H, img_wh)
+        if poly is None or len(poly) < 3:
+            return
+        pts = poly.astype(np.int32)
+        ov = canvas.copy()
+        cv2.fillPoly(ov, [pts], (44, 46, 50), cv2.LINE_AA)   # faint lift over bg
+        cv2.addWeighted(ov, 0.45, canvas, 0.55, 0, canvas)
+        ego = style.THEME["ego"]
+        cv2.polylines(canvas, [pts], True, (ego[2], ego[1], ego[0]), 1, cv2.LINE_AA)
+
+    # ------------------------------------------------------------------ #
     def _build_radar_bg(self) -> np.ndarray:
         """Build the static dark radar background (rings, spokes, FOV, vignette).
 
@@ -197,14 +253,9 @@ class BEVViewport:
         canvas = np.empty((H, W, 3), np.uint8)
         canvas[:] = _bgr(style.THEME["bev_bg"])
 
-        # Forward field-of-view wedge, very subtly brighter than the ground.
-        fov = np.deg2rad(58)
-        arc = [(int(cx + r_max * np.sin(t)), int(cy - r_max * np.cos(t)))
-               for t in np.linspace(-fov, fov, 40)]
-        wedge = np.array([(cx, cy)] + arc, np.int32)
-        ov = canvas.copy()
-        cv2.fillPoly(ov, [wedge], _bgr((33, 33, 33)), cv2.LINE_AA)
-        cv2.addWeighted(ov, 0.55, canvas, 0.45, 0, canvas)
+        # (The visible field of view is drawn per-frame from the live
+        # homography by ``draw_fov``; the static background no longer bakes a
+        # fixed wedge, so the radar reflects what the camera actually sees.)
 
         # Metric range rings. The BEV scale is pinned so a median footprint is
         # ``object_px`` on screen, hence canvas distance = range measured in

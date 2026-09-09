@@ -1,0 +1,51 @@
+diff --git a/ultralytics/data/augment.py b/ultralytics/data/augment.py
+index b564d01e2..24aa40f8f 100644
+--- a/ultralytics/data/augment.py
++++ b/ultralytics/data/augment.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import math
++import os
+ import random
+ from copy import deepcopy
+ from typing import Any
+@@ -2689,6 +2690,30 @@ class RandomLoadText(BaseTransform):
+         return labels
+ 
+ 
++class RandomGrayscale:
++    """Randomly desaturate the image to grayscale (kept 3-channel), pixel-only.
++
++    Used to make the model robust to vehicle color / monochrome footage. The
++    probability is read from the ``V2_GRAYSCALE_P`` env var (default 0.0 = off) so
++    it needs no new cfg key and still propagates to DDP dataloader workers, which
++    inherit the parent environment. Image-only: boxes and keypoints are untouched,
++    so it is safe for the hybrid pose data.
++    """
++
++    def __init__(self, p: float = 0.0):
++        """Initialize with grayscale probability ``p``."""
++        self.p = p
++
++    def __call__(self, labels):
++        """Convert the image to 3-channel grayscale with probability ``p``."""
++        if self.p and np.random.rand() < self.p:
++            img = labels["img"]
++            if img.ndim == 3 and img.shape[-1] == 3:
++                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
++                labels["img"] = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
++        return labels
++
++
+ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bool = False):
+     """Apply a series of image transformations for training.
+ 
+@@ -2757,6 +2782,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
+             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
+             Albumentations(p=1.0, transforms=getattr(hyp, "augmentations", None)),
+             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
++            RandomGrayscale(p=float(os.environ.get("V2_GRAYSCALE_P", 0.0))),
+             RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
+             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
+         ]

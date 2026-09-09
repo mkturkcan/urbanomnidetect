@@ -119,7 +119,8 @@ class RealtimePipeline:
                  aux_footprint=False, aux_overlap=0.12, aux_width_scale=0.9,
                  aux_aspect=None, aux_gate=False, aux_gate_iou=0.3, draw_aux_box=True,
                  trails=True, trail_len=16, stabilize=True, bev_window=512,
-                 tracker_kwargs=None, bev_canvas=None, predict_fn=None):
+                 show_fov=True, aux_every=1, tracker_kwargs=None, bev_canvas=None,
+                 predict_fn=None):
         self.pose_model = pose_model
         self.aux_model = aux_model
         self.kp_imgsz = kp_imgsz
@@ -139,6 +140,10 @@ class RealtimePipeline:
         self._n_gated = 0
         self.trails = trails
         self.trail_len = int(trail_len)
+        self.show_fov = bool(show_fov)
+        # Run the auxiliary detector only every Nth frame (its tracker coasts in
+        # between); amortises its cost for real-time without losing the markers.
+        self.aux_every = max(1, int(aux_every))
         self._trails: dict = {}     # track id -> deque of BEV-canvas centres
         # Footprint accumulation buffer: the ground plane is a scene constant,
         # so solving the homography over a rolling window of recent footprints
@@ -159,9 +164,21 @@ class RealtimePipeline:
         self._bev_unit_locked = None
         self._last_N = None
         self._predict_fn = predict_fn  # override for sliced inference
+        # Optional world-locked BEV: a single fixed viewport similarity used for
+        # every frame instead of the per-frame one (set by the offline runner
+        # for clips whose moving camera makes the radar swim). None = per-frame.
+        self._frozen_sim = None
 
         self.resolver = GroundIndexResolver(forced=ground_indices)
         self.tracker = MultiObjectTracker(**(tracker_kwargs or {}))
+        # A lightweight box tracker for the auxiliary detections: it coasts short
+        # gaps and requires a few hits before showing, so the aux markers stop
+        # flickering on/off as the auxiliary detector's confidence wobbles.
+        self.aux_tracker = None
+        if aux_model is not None:
+            akw = dict(tracker_kwargs or {})
+            akw.update(max_age=10, min_hits=2, conf_thresh=self.aux_conf)
+            self.aux_tracker = MultiObjectTracker(**akw)
         self.solver = OrthoHomographySolver(ema=solver_ema)
         self.aux = AuxCenterRegressor(lam=aux_lam)
         self.viewport: Optional[BEVViewport] = None
@@ -190,7 +207,8 @@ class RealtimePipeline:
         res = self.aux_model.predict(frame, imgsz=self.kp_imgsz,
                                      conf=self.aux_conf, device=self.device,
                                      verbose=False)[0]
-        return parse_boxes_result(res, conf_thresh=self.aux_conf)
+        return parse_boxes_result(res, conf_thresh=self.aux_conf,
+                                  class_filter=AUX_CLASSES)
 
     def _gate_by_aux(self, dets, aux_raw):
         """Drop pose detections the auxiliary detector cannot corroborate.
@@ -213,15 +231,24 @@ class RealtimePipeline:
         return kept
 
     def _aux_display(self, aux_raw, track_boxes):
-        """Auxiliary boxes that are NOT duplicates of a track, plus their
-        ridge-predicted ground centres (for BEV display)."""
+        """Auxiliary boxes that are NOT duplicates of a track, plus their ground
+        centres for BEV display.
+
+        The marker is placed at the box ground-contact (bottom-centre): always a
+        valid in-image ground point, so the BEV maps it through H without ever
+        exploding near the horizon (which the learned ridge map could, flinging
+        a dot off-screen for one frame). The ridge map (paper Sec. 3.5) is still
+        fit for completeness but no longer drives the on-screen marker.
+        """
         aux = aux_raw
         if aux and len(track_boxes):
             ab = np.array([d.xyxy for d in aux])
             iou = _iou_matrix(ab, np.array(track_boxes))
             aux = [d for i, d in enumerate(aux) if iou[i].max(initial=0.0) < 0.45]
-        centers = (self.aux.predict(np.array([d.xyxy for d in aux]))
-                   if aux else np.zeros((0, 2)))
+        if not aux:
+            return aux, np.zeros((0, 2))
+        ab = np.array([d.xyxy for d in aux])
+        centers = np.stack([(ab[:, 0] + ab[:, 2]) * 0.5, ab[:, 3]], axis=1)
         return aux, centers
 
     # ------------------------------------------------------------------ #
@@ -241,7 +268,13 @@ class RealtimePipeline:
         self.sw.lap("pose")
 
         # Auxiliary detector runs before tracking so it can gate hallucinations.
-        aux_raw = self._detect_aux_raw(frame)
+        # On a cadence (aux_every>1, no gating) we skip it and let the aux tracker
+        # coast, which keeps the markers alive at a fraction of the cost.
+        if (self.aux_every > 1 and not self.aux_gate
+                and (self.frame_idx % self.aux_every) != 0):
+            aux_raw = []
+        else:
+            aux_raw = self._detect_aux_raw(frame)
         self.sw.lap("aux")
 
         n_gated = 0
@@ -251,7 +284,7 @@ class RealtimePipeline:
             n_gated = n_before - len(dets)
 
         gi = self.resolver.indices(8)
-        tracks = self.tracker.update(dets, img_wh, ground_indices=gi)
+        tracks = self.tracker.update(dets, img_wh, ground_indices=gi, frame=frame)
         self.sw.lap("track")
 
         # Fit the auxiliary ground-centre map on confirmed tracks that carry a
@@ -261,10 +294,17 @@ class RealtimePipeline:
             if t.ground.shape == (4, 2):
                 anchor_boxes.append(t.box_xyxy)
                 anchor_centers.append(t.ground.mean(axis=0))
-        if len(anchor_boxes) >= 2:
-            self.aux.fit(np.array(anchor_boxes), np.array(anchor_centers))
+        self.aux.fit(np.array(anchor_boxes) if anchor_boxes else np.zeros((0, 4)),
+                     np.array(anchor_centers) if anchor_centers else np.zeros((0, 2)))
         track_boxes = [t.box_xyxy for t in tracks]
-        aux_dets, aux_centers = self._aux_display(aux_raw, track_boxes)
+        # Persist/de-flicker the auxiliary detections through their own tracker
+        # before display (raw detections are kept for gating above).
+        if self.aux_tracker is not None:
+            aux_for_disp = [t.to_detection()
+                            for t in self.aux_tracker.update(aux_raw, img_wh, frame=frame)]
+        else:
+            aux_for_disp = aux_raw
+        aux_dets, aux_centers = self._aux_display(aux_for_disp, track_boxes)
 
         # Solve the orthogonality homography. With stabilisation enabled we
         # solve over a rolling buffer of recent footprints (the ground plane is
@@ -379,7 +419,10 @@ class RealtimePipeline:
             cw = self._bev_canvas or state.img_wh
             self.viewport = BEVViewport(canvas_size=cw)
         if self.use_homography:
-            self.viewport.update(state.H, state.img_wh, unit=state.bev_unit)
+            if self._frozen_sim is not None:
+                self.viewport._sim = self._frozen_sim   # world-locked BEV
+            else:
+                self.viewport.update(state.H, state.img_wh, unit=state.bev_unit)
         return self._render(state)
 
     def process(self, frame) -> np.ndarray:
@@ -396,9 +439,14 @@ class RealtimePipeline:
         src_labels = []   # (x, y, text, color, coasting)
 
         # --- camera panel geometry ---
+        # Auxiliary boxes: coloured by semantic class (COCO), drawn DASHED so
+        # they stay visually distinct from the solid pose 3D cuboids.
         if self.draw_aux_box:
             for d in aux_dets:
-                draw_box(src, d.xyxy, style.THEME["aux"], thickness=1, halo=True, radius=4)
+                acol = style.class_color(int(d.cls), source="coco")
+                x1, y1, x2, y2 = [float(v) for v in d.xyxy]
+                draw_dashed_polyline(src, [(x1, y1), (x2, y1), (x2, y2), (x1, y2)],
+                                     acol, thickness=2, dash=9, gap=6, halo=True)
         for t in tracks:
             col = style.instance_color(t.cls, t.id, source="pose")
             coasting = t.time_since_update > 0
@@ -411,6 +459,10 @@ class RealtimePipeline:
 
         # --- BEV panel geometry ---
         bev = self.viewport.blank_canvas(radar=True)
+        # Show the camera's actually-visible field of view (image border mapped
+        # to the ground), under everything else.
+        if self.use_homography and self.show_fov:
+            self.viewport.draw_fov(bev, H, state.img_wh)
         bev_labels = []   # (cx, cy, id)
         present = set()
         if self.use_homography:
@@ -525,6 +577,35 @@ class RealtimePipeline:
                     color=(236, 236, 236), anchor="mm")
 
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _rect_shape(S):
+        """Best-fit rectangle of a centred 4x2 footprint, corner order kept.
+
+        A vehicle footprint is a rectangle, so under that rigid-body prior we
+        project the accumulated shape onto its nearest rectangle: estimate the
+        dominant (length) axis from the averaged opposite edges, then set each
+        corner to the mean half-width / half-length along the orthonormal axes.
+        Each corner keeps its quadrant, so the cyclic order is preserved.
+        """
+        S = np.asarray(S, dtype=np.float64)
+        C = S - S.mean(axis=0)
+        e = np.roll(C, -1, axis=0) - C            # edges e0..e3
+        u = 0.5 * (e[0] - e[2])                    # width vector
+        v = 0.5 * (e[1] - e[3])                    # length vector
+        q = v if (v @ v) >= (u @ u) else u
+        nq = float(np.hypot(q[0], q[1]))
+        if nq < 1e-9:
+            return S
+        q = q / nq
+        p = np.array([-q[1], q[0]])               # orthogonal axis
+        along, perp = C @ q, C @ p
+        half_l = float(np.mean(np.abs(along)))
+        half_w = float(np.mean(np.abs(perp)))
+        sa = np.where(along >= 0, 1.0, -1.0)
+        sp = np.where(perp >= 0, 1.0, -1.0)
+        return (sp[:, None] * half_w) * p[None, :] + (sa[:, None] * half_l) * q[None, :]
+
+    # ------------------------------------------------------------------ #
     def _rigid_footprint(self, t, H, bev_unit):
         """Estimate a track's CONSTANT footprint and return it posed this frame.
 
@@ -551,14 +632,23 @@ class RealtimePipeline:
         if st is None or st["cls"] != t.cls:        # new track (or class change)
             self._rigid[t.id] = {"S": Q.copy(), "W": 1.0, "locked": False,
                                  "cls": t.cls, "rms": deque(maxlen=30)}
-            return P                                 # render raw first observation
+            # Render the first observation rectangle-snapped (not the raw quad),
+            # so a short track that never reaches the smoother is still shape-
+            # consistent with its later posed frames.
+            S0 = self._rect_shape(Q) if self.snap_rect else Q
+            return (S0 + cP) * bev_unit
         S = st["S"]
-        # Kabsch rotation aligning the constant shape S to this frame's Q (Q ~ R S).
-        C = Q.T @ S
+        # The constant shape is a rigid vehicle footprint, i.e. a rectangle, so
+        # snap the accumulated shape to its best-fit rectangle before posing.
+        # This guarantees right-angled rendered footprints even where keypoint
+        # noise leaves the single global homography imperfect.
+        S_use = self._rect_shape(S) if self.snap_rect else S
+        # Kabsch rotation aligning the constant shape to this frame's Q (Q ~ R S).
+        C = Q.T @ S_use
         U, _, Vt = np.linalg.svd(C)
         dsign = 1.0 if np.linalg.det(U @ Vt) >= 0 else -1.0
         R = U @ np.array([[1.0, 0.0], [0.0, dsign]]) @ Vt
-        posed = S @ R.T                              # constant shape at this heading
+        posed = S_use @ R.T                          # constant shape at this heading
         # Update the shape estimate (MLE running mean) on matched, in-lier frames.
         if t.time_since_update == 0 and not st["locked"]:
             # Footprint area (normalised; median object ~= 1). Skip degenerate /
@@ -631,10 +721,27 @@ class RealtimePipeline:
         elif len(aux_centers):
             # Auxiliary detections shown ONLY as their predicted ground-centre
             # (a clean marker), since the box->footprint estimate is unreliable.
-            ac = (aux_col[2], aux_col[1], aux_col[0])
-            for c in self.viewport.to_canvas(aux_centers, H):
-                if not np.all(np.isfinite(c)):
-                    continue
+            # Coloured by class to match the camera-view boxes.
+            cc = np.array(self.viewport.camera_canvas, dtype=np.float64)
+            r_max = (self.viewport.H - 2 * self.viewport.margin) * 1.02
+            canv = self.viewport.to_canvas(aux_centers, H)
+
+            def _ok(pt):
+                return np.all(np.isfinite(pt)) and np.hypot(*(pt - cc)) <= r_max
+
+            for i in range(len(canv)):
+                c = canv[i]
+                if not _ok(c) and i < len(aux_dets):
+                    # Predicted centre maps near the horizon and explodes; fall
+                    # back to the box ground-contact (always a valid near point).
+                    x1, y1, x2, y2 = aux_dets[i].xyxy
+                    c = self.viewport.to_canvas(
+                        np.array([[(x1 + x2) * 0.5, y2]]), H)[0]
+                if not _ok(c):
+                    continue                       # genuinely beyond range; skip
+                cls = int(aux_dets[i].cls) if i < len(aux_dets) else -1
+                col = style.class_color(cls, source="coco")
+                ac = (col[2], col[1], col[0])
                 p = (int(c[0]), int(c[1]))
                 glow = bev.copy()
                 cv2.circle(glow, p, 11, ac, -1, cv2.LINE_AA)
@@ -701,6 +808,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--track-beta", type=float, default=0.08)
     p.add_argument("--max-age", type=int, default=30)
     p.add_argument("--min-hits", type=int, default=2)
+    p.add_argument("--no-cmc", action="store_true",
+                   help="disable tracker camera-motion compensation (faster, "
+                        "but more ID switches under a moving camera)")
     p.add_argument("--output", default=None, help="write annotated mp4 here")
     p.add_argument("--display", action="store_true", help="show a live window")
     p.add_argument("--max-frames", type=int, default=0, help="0 = all")
@@ -711,6 +821,34 @@ def build_argparser() -> argparse.ArgumentParser:
                         "jitter-free render. Odd windows recommended (e.g. 11).")
     p.add_argument("--smooth-poly", type=int, default=2,
                    help="Savitzky-Golay polynomial order used by --smooth")
+    p.add_argument("--bev-freeze", action="store_true",
+                   help="world-lock the BEV: hold one fixed viewport (the robust "
+                        "median over the clip) instead of tracking the camera, so "
+                        "the radar stops swimming under a moving/aerial camera. "
+                        "Offline only (used with --smooth).")
+    p.add_argument("--scale-lock", action="store_true",
+                   help="non-causal constant radar scale: fix the BEV object "
+                        "scale to the robust median over the whole clip, so the "
+                        "radar zoom never changes (incl. the warm-up). Offline "
+                        "only (used with --smooth).")
+    p.add_argument("--fixed-camera", choices=["auto", "on", "off"], default="off",
+                   help="treat the camera as static and solve ONE global "
+                        "homography over the whole clip (a true scene invariant: "
+                        "no per-frame wobble). 'auto' decides from measured "
+                        "global motion; 'on' forces it; 'off' keeps per-frame H. "
+                        "Offline only (used with --smooth).")
+    p.add_argument("--no-fov", action="store_true",
+                   help="do not draw the camera's visible field of view on the radar")
+    p.add_argument("--aux-every", type=int, default=1,
+                   help="run the auxiliary detector every Nth frame (its tracker "
+                        "coasts between); amortises cost for real-time. 0/1 = every "
+                        "frame. Ignored when --aux-gate is on.")
+    p.add_argument("--online", action="store_true",
+                   help="CAUSAL streaming stabilisation (no look-ahead): the "
+                        "real-time counterpart of --smooth. One-Euro jitter "
+                        "filtering + zero-lag heading rate-limit + EMA homography "
+                        "+ warm-up scale/viewport lock. Matches the offline look "
+                        "with bounded latency.")
     p.add_argument("--sync", action="store_true",
                    help="render inline (no decoupling); simplest, lowest throughput")
     p.add_argument("--render-procs", type=int, default=1,
@@ -750,6 +888,17 @@ def main(argv=None):
         raise SystemExit(f"could not open input: {args.input}")
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
+    # Real-time perf defaults for the online path (overridable): a smaller
+    # footprint buffer + amortised aux keep the core under one frame time. The
+    # offline path keeps the larger, higher-quality settings untouched.
+    bev_window = args.bev_window
+    aux_every = args.aux_every
+    if args.online:
+        if bev_window == 512:
+            bev_window = 256
+        if aux_every <= 1:
+            aux_every = 2
+
     pipe = RealtimePipeline(
         pose, aux, kp_imgsz=args.kp_imgsz, kp_conf=args.kp_conf,
         aux_conf=args.aux_conf, device=args.device,
@@ -760,20 +909,27 @@ def main(argv=None):
         aux_gate=args.aux_gate, aux_gate_iou=args.aux_gate_iou,
         draw_aux_box=not args.no_aux_box,
         trails=not args.no_trails, trail_len=args.trail_len,
-        stabilize=not args.no_stabilize, bev_window=args.bev_window,
+        stabilize=not args.no_stabilize, bev_window=bev_window,
+        show_fov=not args.no_fov, aux_every=aux_every,
         tracker_kwargs=dict(alpha=args.track_alpha, beta=args.track_beta,
                             max_age=args.max_age, min_hits=args.min_hits,
-                            conf_thresh=args.kp_conf))
+                            cmc=not args.no_cmc, conf_thresh=args.kp_conf))
 
     render_cfg = dict(
         kp_imgsz=args.kp_imgsz, use_homography=(args.homography != "none"),
         show_3d=not args.no_3d, snap_rect=not args.no_snap_rect,
         aux_footprint=args.aux_footprint, aux_overlap=args.aux_overlap,
         aux_width_scale=args.aux_width_scale, aux_gate=args.aux_gate,
-        draw_aux_box=not args.no_aux_box,
+        draw_aux_box=not args.no_aux_box, show_fov=not args.no_fov,
         trails=not args.no_trails, trail_len=args.trail_len)
 
-    if args.smooth and args.smooth >= 3:
+    if args.online and args.render_procs and args.render_procs > 0 and not args.sync:
+        n = _run_process(pipe, cap, args, fps_in, render_cfg)   # decoupled + online
+    elif args.online:
+        sink = _Sink(args, fps_in)
+        n = _run_online(pipe, cap, args, sink, fps_in)          # inline (--sync)
+        sink.close()
+    elif args.smooth and args.smooth >= 3:
         sink = _Sink(args, fps_in)
         n = _run_offline(pipe, cap, args, sink)
         sink.close()
@@ -847,6 +1003,164 @@ def _run_sync(pipe, cap, args, sink) -> int:
     return n
 
 
+def _decide_fixed_camera(mode, frames, mot,
+                         t_thresh=0.003, r_thresh=0.15, s_thresh=0.003) -> bool:
+    """Decide whether to treat the camera as static (one global homography)."""
+    if mode == "on":
+        print("[fixed-camera] forced ON")
+        return True
+    if mode == "off" or len(frames) < 3:
+        return False
+    if mot is None or len(mot) < 2:
+        print("[fixed-camera] auto: no motion estimate -> MOVING")
+        return False
+    m = mot[1:]                                   # drop the leading zero frame
+    h, w = frames[0].shape[:2]
+    diag = float(np.hypot(w, h)) or 1.0
+    tmed = float(np.median(m[:, 0])) / diag
+    rmed = float(np.median(m[:, 1]))
+    smed = float(np.median(m[:, 2]))
+    fixed = (tmed < t_thresh) and (rmed < r_thresh) and (smed < s_thresh)
+    print(f"[fixed-camera] auto: trans {tmed * 100:.3f}%/frame  rot {rmed:.3f} deg "
+          f" scale {smed * 100:.3f}%  -> {'FIXED' if fixed else 'MOVING'}")
+    return fixed
+
+
+# Per-frame drift above this (fraction of image diagonal) means a "fixed" camera
+# is actually slowly panning, so the single global homography must be ego-motion
+# compensated rather than held constant.
+_CMC_COMPENSATE_THRESH = 0.001
+
+
+def _apply_global_homography(pipe, states, C=None, smooth_win=0, smooth_poly=2) -> None:
+    """Solve ONE ground homography over all footprints and pin every frame to it.
+
+    The ground plane is a scene constant. With a static camera the image->ground
+    map is the same every frame, so we batch-fit it over every footprint (far
+    more data, no per-frame jitter). With a SLOWLY MOVING camera (``C`` given:
+    the cumulative ego-motion ``C[t]`` mapping frame 0 -> frame t), the ground
+    plane is still constant but the camera is not, so we fold the ego-motion in:
+    footprints from every frame are brought into one reference frame to fit
+    ``H0``, and each frame renders with ``H_t = H0 @ inv(C[t])``. The global BEV
+    frame then follows the camera smoothly (CMC is detection-independent), so
+    objects entering as the camera pans no longer wobble the whole view.
+    """
+    n = len(states)
+    use_cmc = C is not None and len(C) == n
+    Cinv = None
+    if use_cmc:
+        try:
+            mid = n // 2
+            inv_mid = np.linalg.inv(C[mid])
+            Cinv = [np.linalg.inv(Ci @ inv_mid) for Ci in C]   # ref = middle frame
+        except np.linalg.LinAlgError:
+            use_cmc = False
+
+    foot = []
+    for i, s in enumerate(states):
+        for v in s.tracks:
+            g = np.asarray(v.ground)
+            if g.shape == (4, 2) and np.all(np.isfinite(g)):
+                foot.append(apply_homography(g, Cinv[i]) if use_cmc else g)
+    if len(foot) < 4:
+        print(f"[fixed-camera] only {len(foot)} footprints; keeping per-frame H")
+        return
+    pipe.solver.reset()
+    H0, info = pipe.solver.solve(foot)
+    _, unit = RealtimePipeline._class_footprint_dims(foot, [0] * len(foot), H0)
+    if not (unit and unit > 1e-9 and np.all(np.isfinite(H0))):
+        print("[fixed-camera] degenerate global solve; keeping per-frame H")
+        return
+    # Pin per-frame H (= H0, ego-motion compensated when moving) and re-pose
+    # every footprint in that single reference gauge.
+    pipe._rigid.clear()
+    for i, s in enumerate(states):
+        s.H = (H0 @ Cinv[i]) if use_cmc else H0.copy()
+        s.bev_unit = unit
+        for v in s.tracks:
+            g = np.asarray(v.ground)
+            v.bev_quad = (pipe._rigid_footprint(v, s.H, unit)
+                          if g.shape == (4, 2) else None)
+    # The footprints were just rebuilt in a new gauge, so the main smoothing
+    # pass never saw them: re-smooth their pose to kill single-frame Kabsch
+    # heading flips (the instantaneous BEV flicker).
+    if smooth_win and smooth_win >= 3:
+        from uod.smoothing import smooth_footprints
+        smooth_footprints(states, win=int(smooth_win), poly=int(smooth_poly))
+    from uod.bev import BEVViewport
+    cw = pipe._bev_canvas or states[0].img_wh
+    vp = BEVViewport(canvas_size=cw)
+    vp.update(H0, states[0].img_wh, unit=unit)     # world-locked to the reference
+    if vp._sim is not None:
+        pipe._frozen_sim = vp._sim
+    tag = "ego-motion-compensated" if use_cmc else "static"
+    print(f"[fixed-camera] {tag} global H over {len(foot)} footprints "
+          f"(loss {info.loss:.2e}, {info.iterations} it); viewport + scale locked")
+
+
+def _stabilize_offline(pipe, states, fixed, traj_C, traj_steps, args) -> None:
+    """Non-causal stabilisation back-end (looks across the whole clip).
+
+    This is the offline half of the shared causal core: it zero-phase smooths
+    every track's pose/footprint and the auxiliary markers, then pins the BEV
+    frame -- a single global (optionally ego-motion-compensated) homography for a
+    fixed camera, or median scale-lock / world-lock otherwise. Mutates ``states``
+    in place. The streaming online back-end (:class:`uod.stabilize.OnlineStabilizer`)
+    mirrors this with bounded latency.
+    """
+    from uod.smoothing import smooth_states, smooth_aux_centers
+
+    # H is a constant when the camera is fixed, so do not bother smoothing it.
+    smooth_states(states, win=int(args.smooth), poly=int(args.smooth_poly),
+                  smooth_H=(args.homography != "none") and not fixed)
+    # Spike-filter the auxiliary marker centres (their ridge map can fling a dot
+    # off-screen for a single frame).
+    smooth_aux_centers(states, win=int(args.smooth), poly=int(args.smooth_poly))
+
+    if fixed and pipe.use_homography and states:
+        # Ego-motion-compensate the global H only when there is real residual
+        # drift (a slowly panning "fixed" camera); otherwise hold it constant so
+        # optical-flow noise never injects motion into a truly static view.
+        C = None
+        if traj_C is not None and traj_steps is not None and len(traj_steps) > 1:
+            diag = float(np.hypot(*states[0].img_wh)) or 1.0
+            if float(np.median(traj_steps[1:, 0])) / diag > _CMC_COMPENSATE_THRESH:
+                C = traj_C
+        _apply_global_homography(pipe, states, C,
+                                 smooth_win=int(args.smooth),
+                                 smooth_poly=int(args.smooth_poly))
+    else:
+        # Constant radar scale (non-causal): pin every frame's BEV scale to the
+        # robust median object size over the whole clip (the live path can only
+        # lock it after a warm-up).
+        if getattr(args, "scale_lock", False):
+            units = [s.bev_unit for s in states if s.bev_unit and s.bev_unit > 1e-9]
+            if units:
+                g = float(np.median(units))
+                for s in states:
+                    s.bev_unit = g
+        # World-lock the BEV: one fixed similarity (robust median over the clip)
+        # so a moving/aerial camera no longer drags the radar around.
+        if getattr(args, "bev_freeze", False) and pipe.use_homography:
+            from uod.bev import BEVViewport, _Sim
+            cw = pipe._bev_canvas or states[0].img_wh
+            vp = BEVViewport(canvas_size=cw)
+            origins, angles, scales = [], [], []
+            for s in states:
+                vp.update(np.asarray(s.H, dtype=np.float64), s.img_wh, unit=s.bev_unit)
+                if vp._sim is not None:
+                    origins.append(vp._sim.origin)
+                    angles.append(vp._sim.angle)
+                    scales.append(vp._sim.scale)
+            if origins:
+                origin = np.median(np.stack(origins), axis=0)
+                angle = float(np.arctan2(np.median(np.sin(angles)),
+                                         np.median(np.cos(angles))))
+                scale = float(np.median(scales))
+                pipe._frozen_sim = _Sim(scale=scale, angle=angle, origin=origin,
+                                        offset=np.array(vp.camera_canvas, dtype=np.float64))
+
+
 def _run_offline(pipe, cap, args, sink) -> int:
     """Two-pass NON-CAUSAL runner for the best-looking file render.
 
@@ -856,29 +1170,85 @@ def _run_offline(pipe, cap, args, sink) -> int:
     (see :mod:`uod.smoothing`). Pass 2 renders the cleaned states. This buffers
     all decoded frames in RAM, so it is for offline export, not live streaming.
     """
-    from uod.smoothing import smooth_states
+    from uod.tracking import camera_trajectory
 
-    states = []
-    n = 0
+    # Decode the whole clip once (states will hold references to these frames).
+    frames = []
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+        frames.append(frame)
+        if args.max_frames and len(frames) >= args.max_frames:
+            break
+
+    # Camera ego-motion (one optical-flow pass): used both to classify the
+    # camera and, when it is slowly panning, to ego-motion-compensate the global
+    # homography. Skipped entirely when the global path is disabled.
+    mode = getattr(args, "fixed_camera", "off")
+    traj_C = traj_steps = None
+    if mode != "off" and len(frames) >= 3:
+        traj_C, traj_steps = camera_trajectory(frames)
+    fixed = _decide_fixed_camera(mode, frames, traj_steps)
+    if fixed:
+        pipe.tracker.cmc = False        # global H already handles ego-motion
+        if pipe.aux_tracker is not None:
+            pipe.aux_tracker.cmc = False
+
+    # Pass 1: core (detect/track/solve) over the buffered frames.
+    states = []
+    for frame in frames:
         t0 = time.perf_counter()
         states.append(pipe.step(frame))
         pipe.fps_core = _ema(pipe.fps_core, time.perf_counter() - t0)
-        n += 1
-        if args.max_frames and n >= args.max_frames:
-            break
+    n = len(states)
 
-    smooth_states(states, win=int(args.smooth), poly=int(args.smooth_poly),
-                  smooth_H=(args.homography != "none"))
+    # Non-causal stabilisation (the offline back-end of the shared core).
+    _stabilize_offline(pipe, states, fixed, traj_C, traj_steps, args)
 
     for state in states:
         t0 = time.perf_counter()
         out = pipe.render(state)
         pipe.fps_render = _ema(pipe.fps_render, time.perf_counter() - t0)
         if not sink.emit(out):
+            break
+    return n
+
+
+def _run_online(pipe, cap, args, sink, fps_in) -> int:
+    """CAUSAL streaming runner -- the online counterpart of ``_run_offline``.
+
+    Each frame is detected/tracked/solved by the shared core, then stabilised by
+    :class:`uod.stabilize.OnlineStabilizer` with NO look-ahead, and rendered
+    immediately. Global-frame stability (the offline global-H job) is matched
+    causally: the solver EMA-smooths H, the core already locks the BEV scale once
+    its footprint buffer fills, and once the viewport has held steady for a
+    warm-up window on a static camera we freeze it (world-lock) -- otherwise it
+    keeps following the camera per frame.
+    """
+    from uod.stabilize import OnlineStabilizer, ViewportLock
+
+    if pipe.solver.ema <= 0.0:          # causal H smoothing (offline uses 0 + SavGol)
+        pipe.solver.ema = 0.85
+    pipe.solver.max_iter = min(pipe.solver.max_iter, 8)   # warm-started: few iters
+    stab = OnlineStabilizer(fps_in)
+    lock = ViewportLock(fps_in) if pipe.use_homography else None
+
+    n = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        t0 = time.perf_counter()
+        state = stab.push(pipe.step(frame), n)
+        out = pipe.render(state)
+        pipe.fps_core = pipe.fps_render = _ema(pipe.fps_core, time.perf_counter() - t0)
+        if lock is not None and pipe._frozen_sim is None:
+            fs = lock.update(pipe.viewport, state.img_wh)
+            if fs is not None:
+                pipe._frozen_sim = fs
+        n += 1
+        if not sink.emit(out) or (args.max_frames and n >= args.max_frames):
             break
     return n
 
@@ -944,16 +1314,23 @@ def _run_threaded(pipe, cap, args, sink) -> int:
     return n
 
 
-def _render_worker(cfg, in_q, fps_in, output_path, display, render_fps_val):
+def _render_worker(cfg, in_q, fps_in, output_path, display, render_fps_val,
+                   online=False):
     """Render-only worker process: consumes RenderState, writes/shows frames.
 
     Runs in a separate process (spawn) so it does not contend with the core's
     Python work for the GIL. It builds a model-free render pipeline; rendering
-    needs the viewport, trails, and style only -- never the detectors.
+    needs the viewport, trails, and style only -- never the detectors. In online
+    mode it also owns the causal warm-up world-lock (it is the only place the
+    viewport exists).
     """
     import time as _t
     from bev_realtime import RealtimePipeline, _ema  # re-import in child
     pipe = RealtimePipeline(None, None, **cfg)
+    lock = None
+    if online and pipe.use_homography:
+        from uod.stabilize import ViewportLock
+        lock = ViewportLock(fps_in)
     writer = None
     ema = 0.0
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -965,6 +1342,10 @@ def _render_worker(cfg, in_q, fps_in, output_path, display, render_fps_val):
         pipe.fps_render = ema
         t0 = _t.perf_counter()
         out = pipe.render(state)
+        if lock is not None and pipe._frozen_sim is None:
+            fs = lock.update(pipe.viewport, state.img_wh)
+            if fs is not None:
+                pipe._frozen_sim = fs
         ema = _ema(ema, _t.perf_counter() - t0)
         try:
             render_fps_val.value = ema
@@ -995,12 +1376,20 @@ def _run_process(pipe, cap, args, fps_in, render_cfg) -> int:
     and ships each RenderState to the render process over a bounded queue, which
     applies back-pressure so every frame is rendered (no drops)."""
     import multiprocessing as mp
+    online = getattr(args, "online", False)
+    stab = None
+    if online:
+        from uod.stabilize import OnlineStabilizer
+        if pipe.solver.ema <= 0.0:
+            pipe.solver.ema = 0.85
+        pipe.solver.max_iter = min(pipe.solver.max_iter, 8)
+        stab = OnlineStabilizer(fps_in)
     ctx = mp.get_context("spawn")
     in_q = ctx.Queue(maxsize=max(1, args.queue))
     render_fps = ctx.Value("d", 0.0)
     proc = ctx.Process(target=_render_worker,
                        args=(render_cfg, in_q, fps_in, args.output,
-                             args.display, render_fps), daemon=True)
+                             args.display, render_fps, online), daemon=True)
     proc.start()
     n = 0
     try:
@@ -1010,6 +1399,8 @@ def _run_process(pipe, cap, args, fps_in, render_cfg) -> int:
                 break
             t0 = time.perf_counter()
             state = pipe.step(frame)
+            if stab is not None:
+                state = stab.push(state, n)
             pipe.fps_core = _ema(pipe.fps_core, time.perf_counter() - t0)
             state.fps_core = pipe.fps_core
             in_q.put(state)            # blocks if renderer is behind (no drops)

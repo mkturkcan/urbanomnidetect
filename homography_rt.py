@@ -119,12 +119,22 @@ class OrthoHomographySolver:
 
     def __init__(self, max_iter: int = 30, tol: float = 1e-10,
                  ema: float = 0.0, warm_start: bool = True,
-                 lam0: float = 1e-3):
+                 lam0: float = 1e-3, robust: bool = True,
+                 par_weight: float = 0.5, reliability: bool = True):
         self.max_iter = int(max_iter)
         self.tol = float(tol)
         self.ema = float(ema)
         self.warm_start = bool(warm_start)
         self.lam0 = float(lam0)
+        # Robust metric-rectification controls (see solve / _weights):
+        #   robust      -- IRLS Cauchy weights reject outlier footprint corners.
+        #   par_weight  -- weight of the added parallelism residuals (opposite
+        #                  edges parallel), which complement the right-angle ones.
+        #   reliability -- down-weight near-degenerate (short-edge) footprints
+        #                  whose corner angles are unreliable.
+        self.robust = bool(robust)
+        self.par_weight = float(par_weight)
+        self.reliability = bool(reliability)
         self._theta_prev: Optional[np.ndarray] = None
         self._theta_ema: Optional[np.ndarray] = None
         self._H_prev: Optional[np.ndarray] = None
@@ -169,11 +179,14 @@ class OrthoHomographySolver:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _residuals_and_jac(theta, X, Y, idx, need_jac):
-        """Per-corner edge-cosine residuals (and analytic Jacobian).
+        """Metric-rectification residuals (and analytic Jacobian).
 
-        ``X, Y`` are flat ``(P,)`` arrays of normalised point coordinates;
-        ``idx`` is ``(Q, 4)`` mapping each footprint to its 4 corner indices in
-        cyclic order. Returns residuals ``(4Q,)`` and Jacobian ``(4Q, 4)``.
+        Per footprint we emit 6 residuals: the 4 adjacent-edge cosines (right
+        angles -> 0) and 2 opposite-edge cross products (parallel sides -> 0).
+        ``X, Y`` are flat ``(P,)`` normalised coords; ``idx`` is ``(Q, 4)`` of
+        cyclic corner indices. Returns residuals ``(6Q,)`` laid out quad-major
+        ``[o0 o1 o2 o3 p0 p1]``, Jacobian ``(6Q, 4)``, and each quad's minimum
+        edge length ``(Q,)`` for reliability weighting.
         """
         p, q, a, b = theta
         ea = np.exp(a)
@@ -191,10 +204,15 @@ class OrthoHomographySolver:
         uy = ey / L
         uxn = np.roll(ux, -1, axis=1)     # next edge unit vectors
         uyn = np.roll(uy, -1, axis=1)
-        r = ux * uxn + uy * uyn           # (Q, 4) edge-cosine residuals
+        ux2 = np.roll(ux, -2, axis=1)     # opposite edge unit vectors
+        uy2 = np.roll(uy, -2, axis=1)
+        r_o = ux * uxn + uy * uyn         # (Q, 4) right-angle cosines
+        r_p = (ux * uy2 - uy * ux2)[:, :2]  # (Q, 2) opposite-edge cross products
+        Lmin = L.min(axis=1)              # (Q,)
+        r = np.concatenate([r_o, r_p], axis=1)   # (Q, 6)
         rflat = r.reshape(-1)
         if not need_jac:
-            return rflat, None
+            return rflat, None, Lmin
 
         # d(px, py)/d(theta) at every point.
         dpx = np.empty((4, px.shape[0]))
@@ -219,9 +237,36 @@ class OrthoHomographySolver:
             duy = (dey * L - ey * dL) / (L * L)
             duxn = np.roll(dux, -1, axis=1)
             duyn = np.roll(duy, -1, axis=1)
-            dr = dux * uxn + ux * duxn + duy * uyn + uy * duyn
-            J[:, k] = dr.reshape(-1)
-        return rflat, J
+            dux2 = np.roll(dux, -2, axis=1)
+            duy2 = np.roll(duy, -2, axis=1)
+            dr_o = dux * uxn + ux * duxn + duy * uyn + uy * duyn
+            dr_p = (dux * uy2 + ux * duy2 - duy * ux2 - uy * dux2)[:, :2]
+            J[:, k] = np.concatenate([dr_o, dr_p], axis=1).reshape(-1)
+        return rflat, J, Lmin
+
+    # ------------------------------------------------------------------ #
+    def _weights(self, r: np.ndarray, Lmin: np.ndarray, n: int) -> np.ndarray:
+        """Per-residual weights: reliability x parallelism x robust (Cauchy).
+
+        ``r`` is the ``(6n,)`` residual, ``Lmin`` the ``(n,)`` per-quad minimum
+        edge length. Down-weights near-degenerate footprints, tempers the added
+        parallelism residuals, and applies an IRLS Cauchy weight that suppresses
+        outlier corners so they cannot drag the rectification off the true right
+        angles.
+        """
+        w = np.ones(6 * n)
+        if self.reliability:
+            medL = float(np.median(Lmin)) + 1e-9
+            relq = Lmin ** 2 / (Lmin ** 2 + (0.3 * medL) ** 2)   # (n,)
+            w *= np.repeat(relq, 6)
+        if self.par_weight != 1.0:
+            col = np.tile(np.array([1., 1., 1., 1.,
+                                    self.par_weight, self.par_weight]), n)
+            w *= col
+        if self.robust:
+            c = max(1.5 * float(np.median(np.abs(r))), 0.05)
+            w *= 1.0 / (1.0 + (r / c) ** 2)
+        return w
 
     # ------------------------------------------------------------------ #
     def solve(self, ground_quads, warm_start: Optional[bool] = None):
@@ -279,16 +324,23 @@ class OrthoHomographySolver:
             theta = self._theta_prev.copy()
             warm = True
 
-        r, J = self._residuals_and_jac(theta, X, Y, idx, True)
-        cost = float(r @ r)
+        # Iteratively-reweighted Levenberg-Marquardt. Weights (reliability +
+        # robust Cauchy) are held fixed across a step's damping search and
+        # refreshed once a step is accepted, the standard IRLS schedule.
+        r, J, Lmin = self._residuals_and_jac(theta, X, Y, idx, True)
+        w = self._weights(r, Lmin, n)
+        sw = np.sqrt(w)
+        cost = float((sw * r) @ (sw * r))
         init_cost = cost
         lam = self.lam0
         iters = 0
         converged = False
 
         for iters in range(1, self.max_iter + 1):
-            JtJ = J.T @ J
-            g = J.T @ r
+            Jw = J * sw[:, None]
+            rw = r * sw
+            JtJ = Jw.T @ Jw
+            g = Jw.T @ rw
             diag = np.diag(JtJ).copy()
             improved = 0.0
             stepped = False
@@ -300,14 +352,16 @@ class OrthoHomographySolver:
                     lam *= 10.0
                     continue
                 new = theta + step
-                rn, _ = self._residuals_and_jac(new, X, Y, idx, False)
-                nc = float(rn @ rn)
+                rn, _, _ = self._residuals_and_jac(new, X, Y, idx, False)
+                nc = float((sw * rn) @ (sw * rn))   # same (fixed) weights
                 if nc < cost:
                     theta = new
                     lam = max(lam * 0.3, 1e-9)
-                    r, J = self._residuals_and_jac(theta, X, Y, idx, True)
+                    r, J, Lmin = self._residuals_and_jac(theta, X, Y, idx, True)
+                    w = self._weights(r, Lmin, n)    # reweight (IRLS)
+                    sw = np.sqrt(w)
                     improved = cost - nc
-                    cost = nc
+                    cost = float((sw * r) @ (sw * r))
                     stepped = True
                     break
                 lam *= 10.0

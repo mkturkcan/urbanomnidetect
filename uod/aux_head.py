@@ -52,14 +52,28 @@ class AuxCenterRegressor:
     def fitted(self) -> bool:
         return self._W is not None
 
+    # A 6-parameter linear map needs enough, well-spread anchors or it
+    # extrapolates wildly. With too few -- or near-collinear -- anchor centers
+    # the map projects every auxiliary box onto the line through those anchors
+    # (the "all objects on a line" degeneracy on sparse scenes). Require both.
+    MIN_ANCHORS = 4
+
     def fit(self, boxes_xyxy: np.ndarray, centers: np.ndarray) -> bool:
         """Fit ``W`` from anchor boxes and their ground-footprint centers.
 
-        Returns ``True`` if a usable map was produced (needs >= 2 anchors).
+        Returns ``True`` only if enough non-collinear anchors give a usable map;
+        otherwise leaves the regressor unfitted so callers fall back to a
+        geometric estimate.
         """
         boxes_xyxy = np.asarray(boxes_xyxy, dtype=np.float64)
         centers = np.asarray(centers, dtype=np.float64)
-        if len(boxes_xyxy) < 2 or len(boxes_xyxy) != len(centers):
+        if len(boxes_xyxy) < self.MIN_ANCHORS or len(boxes_xyxy) != len(centers):
+            self._W = None
+            return False
+        # Reject near-collinear anchor centers (degenerate target geometry).
+        cc = centers - centers.mean(axis=0)
+        sv = np.linalg.svd(cc, compute_uv=False)
+        if sv[0] < 1e-6 or sv[1] < 0.12 * sv[0]:
             self._W = None
             return False
         Phi = _features(boxes_xyxy)                  # (N, 6)

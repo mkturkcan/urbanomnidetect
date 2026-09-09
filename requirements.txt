@@ -1,5 +1,5 @@
 # Core runtime
-ultralytics>=8.3.0
+ultralytics>=8.4.61   # v2 checkpoints need the YOLO26 Pose26 head; 8.4.61 is the tested version
 torch>=2.1
 numpy>=1.24
 opencv-python>=4.8
@@ -11,3 +11,6 @@ matplotlib>=3.7
 pillow>=9.0
 # 3D / BEV IoU evaluation (eval3d.py)
 shapely>=2.0
+# Demo reel end card (optional)
+qrcode>=7.0
+# ffmpeg with libx264 must be on PATH for bev_realtime_v2.py --output and the reel builder

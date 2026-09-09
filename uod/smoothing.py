@@ -139,6 +139,80 @@ def _write_kpts(view, xy: np.ndarray) -> None:
         view.kpts = xy
 
 
+def smooth_aux_centers(states, win: int = 11, poly: int = 2) -> None:
+    """Non-causal spike removal + smoothing of auxiliary marker centres.
+
+    Aux dots are placed each frame from a ridge box->ground map; that map can
+    occasionally extrapolate one frame to a wild position (a self-correcting
+    BEV flicker, and near the horizon ``H`` magnifies it). We Hampel + Savitzky-
+    Golay each aux track's image-space centre over time, mirroring the footprint
+    smoothing, so isolated one-frame jumps are replaced by the local median.
+    """
+    if not states or win < 3:
+        return
+    seen: dict = {}
+    for ti, s in enumerate(states):
+        ac = np.asarray(getattr(s, "aux_centers", []), dtype=np.float64).reshape(-1, 2)
+        for i, det in enumerate(getattr(s, "aux_dets", []) or []):
+            tid = getattr(det, "track_id", None)
+            if tid is None or i >= len(ac):
+                continue
+            seen.setdefault(tid, []).append((ti, i, ac[i].copy()))
+    updates: dict = {}
+    for tid, items in seen.items():
+        if len(items) < max(5, poly + 2):
+            continue
+        tis = [it[0] for it in items]
+        t0, t1 = tis[0], tis[-1]
+        L = t1 - t0 + 1
+        xs = np.full(L, np.nan)
+        ys = np.full(L, np.nan)
+        for (ti, i, c) in items:
+            xs[ti - t0], ys[ti - t0] = c[0], c[1]
+        xs = _smooth1d(_interp_nan(xs), win, poly)
+        ys = _smooth1d(_interp_nan(ys), win, poly)
+        for (ti, i, c) in items:
+            updates.setdefault(ti, {})[i] = (xs[ti - t0], ys[ti - t0])
+    for ti, d in updates.items():
+        ac = np.asarray(states[ti].aux_centers, dtype=np.float64).reshape(-1, 2).copy()
+        for i, xy in d.items():
+            ac[i] = xy
+        states[ti].aux_centers = ac
+
+
+def smooth_footprints(states, win: int = 11, poly: int = 2) -> None:
+    """Re-smooth ONLY each track's BEV footprint pose (centroid + heading).
+
+    Used after the footprints are recomputed in a new gauge (the fixed /
+    ego-motion global-homography path), where the main :func:`smooth_states`
+    pass has already run. It catches single-frame Kabsch heading flips that
+    would otherwise show as an instantaneous one-frame BEV flicker; size stays
+    constant because the pose decomposition holds the template fixed.
+    """
+    if not states or win < 3:
+        return
+    seen: dict = {}
+    for ti, s in enumerate(states):
+        for v in s.tracks:
+            seen.setdefault(v.id, {})[ti] = v
+    for tid, fr in seen.items():
+        frames = sorted(fr)
+        if len(frames) < max(5, poly + 2):
+            continue
+        t0, t1 = frames[0], frames[-1]
+        L = t1 - t0 + 1
+        q = np.full((L, 4, 2), np.nan)
+        for f in frames:
+            qv = fr[f].bev_quad
+            if qv is not None and np.asarray(qv).shape == (4, 2):
+                q[f - t0] = np.asarray(qv, dtype=np.float64)
+        qs = _smooth_footprint(q, win, poly)
+        if qs is not None:
+            for f in frames:
+                if fr[f].bev_quad is not None and np.all(np.isfinite(qs[f - t0])):
+                    fr[f].bev_quad = qs[f - t0]
+
+
 def smooth_states(states, win: int = 11, poly: int = 2,
                   smooth_H: bool = True) -> None:
     """Smooth track geometry (and the global homography) across ``states``.
