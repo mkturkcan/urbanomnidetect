@@ -14,3 +14,7 @@ shapely>=2.0
 # Demo reel end card (optional)
 qrcode>=7.0
 # ffmpeg with libx264 must be on PATH for bev_realtime_v2.py --output and the reel builder
+# Optional, for --export tensorrt/onnx. TensorRT must be 10.x: 11.x removed BuilderFlag.FP16.
+# tensorrt>=10,<11
+# onnx
+# onnxruntime-gpu

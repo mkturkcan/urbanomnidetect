@@ -205,3 +205,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# weights, media, run outputs
+*.pt
+*.engine
+*.onnx
+*.mp4
+*.mov
+_work/
+runs/

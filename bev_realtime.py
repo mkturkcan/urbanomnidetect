@@ -871,8 +871,10 @@ def main(argv=None):
     gi = ([int(x) for x in args.ground_indices.split(",")]
           if args.ground_indices else None)
 
+    # task="pose" matters for exported engines/ONNX: their metadata says "detect",
+    # and without it the pose predictor is skipped and keypoints come back empty.
     pose = load_detector(args.kp_model, device=args.device, imgsz=args.kp_imgsz,
-                         export=args.export, half=args.half)
+                         export=args.export, half=args.half, task="pose")
     aux = None
     if args.aux_model and args.aux_model.lower() != "none":
         try:

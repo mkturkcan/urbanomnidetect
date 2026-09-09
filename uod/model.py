@@ -52,7 +52,7 @@ def maybe_export(weights: str, imgsz: int, device: str, fmt: str = "engine",
 
 def load_detector(weights: str, device: str = "cpu", imgsz: int = 640,
                   export: str = "none", half: bool = True,
-                  fuse: bool = True):
+                  fuse: bool = True, task: Optional[str] = None):
     """Load a YOLO detector, optionally exporting to an accelerated backend.
 
     Parameters
@@ -66,6 +66,12 @@ def load_detector(weights: str, device: str = "cpu", imgsz: int = 640,
         CUDA + TensorRT install and a fixed ``imgsz``.
     half : bool
         Use FP16 for the exported engine (GPU only).
+    task : str, optional
+        Ultralytics task for the loaded weights, e.g. ``"pose"``. REQUIRED for an
+        exported ``.engine`` or ``.onnx`` carrying a pose head: the exported metadata
+        records the task as ``detect``, so without this the pose predictor never runs
+        and ``results.keypoints`` comes back ``None`` (boxes still appear, which makes
+        the failure quiet). Ignored for ``.pt``, which carries its own task.
     """
     from ultralytics import YOLO
     path = weights
@@ -75,7 +81,7 @@ def load_detector(weights: str, device: str = "cpu", imgsz: int = 640,
                 f"export={export!r} requires a CUDA device, got device={device!r}")
         path = maybe_export(weights, imgsz=imgsz, device=device, fmt=export,
                             half=half)
-    model = YOLO(path)
+    model = YOLO(path, task=task) if task else YOLO(path)
     # Engines are already fused/optimised; only fuse eager PyTorch graphs.
     if fuse and path.endswith(".pt"):
         try:

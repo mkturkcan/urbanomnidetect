@@ -78,6 +78,7 @@ python bev_realtime_v2.py --input clip.mp4 --kp-model checkpoints/urbanomnidetec
 - `--kp-imgsz 960` runs the 640-trained model at a larger input; on drone footage this roughly doubles the far traffic that is tracked, and the cuboids stay tight (1280 works too).
 - `--suppress-nested 0.85` keeps one track per box truck: the end-to-end head reports no NMS and can emit a whole truck and its cab as two detections; the flag drops a vehicle box nested inside a larger vehicle box when their cuboid footprints overlap, and leaves a car standing in front of a bus alone.
 - `--refine` is the offline pass (`REFINE_README.md`); drop it for a causal, streaming render. `--layout side` gives the plain camera | BEV view.
+- `--export tensorrt --half` builds an FP16 engine on first use and reuses it afterwards. Measured on the x model at 960 px on one RTX PRO 6000: **4.6 ms per frame (217 fps) against 7.7 ms (130 fps) in PyTorch FP32**, a 1.7x speed-up, with cuboid corners agreeing to a median 0.9 px. End to end the whole pipeline runs at 48 fps against 45, because the detector is no longer the bottleneck once tracking, the ground solve and rendering are counted. Needs TensorRT 10.x; 11.x removed the builder-flag API Ultralytics uses.
 - Everything else is documented in `USAGE.md` (`python bev_realtime_v2.py --help`).
 
 ### Demo reel and labels
