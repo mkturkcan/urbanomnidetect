@@ -32,19 +32,13 @@ v2 replaces the pose-only v1 detector with a single **hybrid detect + pose** net
 
 Every checkpoint is the epoch of its run with the highest road-class pose mAP, followed by a class-branch-only fine-tune on real box data (COCO + VisDrone) that corrects class boundaries learnt from renders; the pose head is untouched by that step. Metrics on the mixed validation set (COCO, VisDrone, KITTI/DAIR, CDrone, renders) at 640 px.
 
-| Model | Params | Road-class pose mAP50-95 | Box mAP50-95 (all 80 classes) | VisDrone box mAP50-95 | Download |
-|:------|------:|:---:|:---:|:---:|:---|
-| `urbanomnidetect_v2_x_640.pt` | 62.9 M | **0.190** | 0.275 | 0.221 | Hugging Face |
-| `urbanomnidetect_v2_l_640.pt` | 28.7 M | 0.181 | 0.266 | 0.211 | Hugging Face |
-| `urbanomnidetect_v2_m_640.pt` | 24.3 M | 0.176 | 0.261 | 0.208 | Hugging Face |
-| `urbanomnidetect_v2_s_640.pt` | 11.9 M | 0.142 | 0.198 | 0.157 | Hugging Face |
-| `urbanomnidetect_v2_n_640.pt` | 3.7 M | 0.103 | 0.135 | 0.108 | Hugging Face |
-
-Pose mAP uses the strict eight-corner OKS and reads low in absolute terms; the numbers are comparable across scales and epochs, and the cuboids are judged on footage (see the demo reel). The VisDrone column is after the class fine-tune. Class ids are COCO's (`0 person, 1 bicycle, 2 car, 3 motorcycle, 5 bus, 7 truck`, ...).
-
-**Known trade-off in the class fine-tune.** That last step improves classes and aggregate box mAP (VisDrone 0.208 -> 0.221 and COCO 0.281 -> 0.299 on the x model) and finds noticeably more pedestrians, bikes and trucks. It also costs some recall on dark, low-contrast vehicles, because in this architecture the class branch produces the detection score: retraining it changes which objects clear the threshold, not just what they are called. Measured on one sparse aerial clip, the fine-tuned x model held 10 vehicle tracks where the pre-fine-tune weights held 13, and it misses a dark car alone in a bright intersection. Lowering `--kp-conf` does not recover it. Keypoint geometry is untouched: on detections the two agree on, the eight corners match to 0.0000 px. If your footage is dominated by dark vehicles on light ground, evaluate both; the pre-fine-tune weights of every scale are kept alongside the released ones.
-
-**Keypoint convention (v2).** Each detection carries `[8, 3]` keypoints: corners **0–3 are the ground contact corners** and **4–7 the roof**, with roof corner `i+4` above ground corner `i`; corners 0 and 3 are the front face. The third channel is the model's confidence that the instance has a 3D box, not visibility; gate cuboids at `>= 0.5`. This is the opposite ground/roof order from the v1 checkpoints.
+| Model | Params (M) | COCO AP | VisDrone AP @960 | KITTI 2D AP (Mod) | KITTI AP3D E / M / H | KITTI APBEV E / M / H | Download |
+| --- | --: | --: | --: | --: | --: | --: | --- |
+| v2-N | 2.6 | 14.3 | 14.6 | 91.5 | 31.5 / 22.2 / 18.8 | 37.0 / 26.5 / 22.4 | [urbanomnidetect_v2_n_640.pt](https://huggingface.co/mehmetkeremturkcan/UrbanOmniDetect/resolve/main/checkpoints/urbanomnidetect_v2_n_640.pt) |
+| v2-S | 9.9 | 21.3 | 19.1 | 94.6 | 42.9 / 32.5 / 27.6 | 49.7 / 37.5 / 31.0 | [urbanomnidetect_v2_s_640.pt](https://huggingface.co/mehmetkeremturkcan/UrbanOmniDetect/resolve/main/checkpoints/urbanomnidetect_v2_s_640.pt) |
+| v2-M | 21.3 | 28.1 | 25.1 | 95.4 | 46.3 / 34.8 / 30.7 | 50.7 / 39.6 / 35.3 | [urbanomnidetect_v2_m_640.pt](https://huggingface.co/mehmetkeremturkcan/UrbanOmniDetect/resolve/main/checkpoints/urbanomnidetect_v2_m_640.pt) |
+| v2-L | 25.7 | 28.7 | 25.1 | 96.5 | **53.6 / 39.4 / 33.1** | **56.7 / 42.5 / 36.9** | [urbanomnidetect_v2_l_640.pt](https://huggingface.co/mehmetkeremturkcan/UrbanOmniDetect/resolve/main/checkpoints/urbanomnidetect_v2_l_640.pt) |
+| v2-X | 57.6 | **30.4** | **26.7** | **96.6** | 47.5 / 37.1 / 32.9 | 52.1 / 41.1 / 36.4 | [urbanomnidetect_v2_x_640.pt](https://huggingface.co/mehmetkeremturkcan/UrbanOmniDetect/resolve/main/checkpoints/urbanomnidetect_v2_x_640.pt) |
 
 ### Quick start (v2)
 
